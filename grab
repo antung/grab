@@ -1,0 +1,701 @@
+#!/usr/bin/python
+# coding: utf-8
+# Write by Andy.Tang (antung119@gmail.com)
+
+import os
+import sys
+#from optparse import OptionParser
+import re
+from collections import deque
+import time
+from threading import Thread
+import signal
+
+VERSION = '2.0'
+LAST_UPDATE = '2-Sep-2015'
+
+DEBUG = False
+
+#=========================================================================
+build_error_filters = [
+                       r':\d{1,}:.*error.*:',  #eg. current.txt:73731: error 8: Removed or EntTunerServiceListener.java:331: error: cannot find symbol
+                       r'No rule to make target',
+                       r'missing separator',
+                       r'No targets specified and no makefile found. Stop.',
+                       r'No targets. Stop.',
+                       r'make.*: could not',
+                       r': ld returned',
+                       r'Makefile .* was not found.',
+                       r'Included makefile .* was not found.',
+                       r'Recursive variable .* references itself (eventually). Stop.',
+                       r'Unterminated variable reference. Stop.',
+                       r'missing target pattern. Stop.',
+                       r'multiple target patterns. Stop.',
+                       r'target pattern contains no .* Stop.',
+                       r'mixed implicit and static pattern rules. Stop.',
+                       r'missing rule before recipe. Stop.',
+                       r'recipe commences before first target. Stop.',
+                       r'signal description'
+                      ]
+
+#=========================================================================
+line_no = -1
+last_matched_no = -1
+show_line_no = False
+show_file_name = False
+grep_result = [] #item = [line_index, "entire content", "matched text"]
+history = deque(maxlen=0) #default as 1
+app_abort = False
+wait_user_command = False
+ 
+class fprinter:
+    TYPE_TITLE = 0x01
+    TYPE_ERROR = 0x02
+    TYPE_NORMAL = 0x03
+    
+    FORMAT_TITLE_SHELL = '\033[32;1m%s\033[0m'
+    FORMAT_ERROR_SHELL = '\033[31;1m%s\033[0m'
+    FORMAT_KEYWORD_SHELL = '\033[32;1m%s\033[0m'
+    
+    STD_INPUT_HANDLE = -10  
+    STD_OUTPUT_HANDLE= -11  
+    STD_ERROR_HANDLE = -12  
+      
+    FOREGROUND_BLACK = 0x0  
+    FOREGROUND_BLUE = 0x01 # text color contains blue.  
+    FOREGROUND_GREEN= 0x02 # text color contains green.  
+    FOREGROUND_RED = 0x04 # text color contains red.  
+    FOREGROUND_WHITE = 0x07
+    FOREGROUND_INTENSITY = 0x08 # text color is intensified.  
+      
+    BACKGROUND_BLUE = 0x10 # background color contains blue.  
+    BACKGROUND_GREEN= 0x20 # background color contains green.  
+    BACKGROUND_RED = 0x40 # background color contains red.  
+    BACKGROUND_INTENSITY = 0x80 # background color is intensified.
+
+    #return: [(is keyword?, body),(),()...]    
+    def split(self, text, keywords):
+        result = []
+        #self.debug("split:", text, keywords)
+        if ((keywords == None) or (len(keywords) == 0)):
+            result.append([False, text])
+            return result
+            
+        keyword_pos = []
+        for key in keywords:
+            pos = text.find(key)
+            if (pos > -1):
+                keyword_pos.append((pos, key))
+            
+        keyword_pos = sorted(keyword_pos, cmp=lambda x, y : x[0] - y[0])
+        
+        index = 0
+        for key in keyword_pos:
+            if (len(key[1]) == len(text)):
+                continue
+            #split the part of not keywords
+            if (index < key[0]):
+                body = text[index:key[0]]
+                s = [False, body]
+                result.append([False, body])
+                index += len(body)
+            #else: keyword part just start from here
+                
+            #split the keyword part
+            if (index < key[0] + len(key[1])):
+                body = text[index : key[0] + len(key[1])]
+                result.append([True, body])
+                index = key[0] + len(key[1])
+        if (index < len(text)):
+            result.append([False, text[index:]])
+            
+        return result
+        
+    def printf (self, text, type=TYPE_NORMAL, keywords=[]):
+        if (os.name == 'posix'):
+            if (type == self.TYPE_ERROR): 
+                print (self.FORMAT_ERROR_SHELL % text)
+            elif (type == self.TYPE_TITLE):
+                print (self.FORMAT_TITLE_SHELL % text)
+            elif (type == self.TYPE_NORMAL):
+                split_list = self.split(text, keywords)
+                for s in split_list:
+                    if (s[0]):
+                        sys.stdout.write (self.FORMAT_KEYWORD_SHELL % s[1])
+                    else:
+                        sys.stdout.write (s[1])
+            else:
+                print (text)
+        elif (os.name == 'nt'): 
+            import ctypes
+            handle = ctypes.windll.kernel32.GetStdHandle(self.STD_OUTPUT_HANDLE)
+            if (type == self.TYPE_ERROR): 
+                try:
+                    ctypes.windll.kernel32.SetConsoleTextAttribute(handle, self.FOREGROUND_RED | self.FOREGROUND_INTENSITY) 
+                    sys.stdout.write (text + '\n')
+                finally:
+                    ctypes.windll.kernel32.SetConsoleTextAttribute(handle, self.FOREGROUND_WHITE)
+            elif (type == self.TYPE_TITLE):
+                try:
+                    ctypes.windll.kernel32.SetConsoleTextAttribute(handle, self.FOREGROUND_GREEN | self.FOREGROUND_INTENSITY) 
+                    sys.stdout.write (text)
+                finally:
+                    ctypes.windll.kernel32.SetConsoleTextAttribute(handle, self.FOREGROUND_WHITE)
+            elif (type == self.TYPE_NORMAL):
+                split_list = self.split(text, keywords)
+                for s in split_list:
+                    if (s[0]):
+                        try:
+                            ctypes.windll.kernel32.SetConsoleTextAttribute(handle, self.FOREGROUND_GREEN) 
+                            sys.stdout.write (s[1])
+                        finally:
+                            ctypes.windll.kernel32.SetConsoleTextAttribute(handle, self.FOREGROUND_WHITE)
+                    else:
+                        sys.stdout.write (s[1])
+                
+            else:             
+                print (text)
+        else: 
+            print (text)
+    
+    def debug(self, *args):
+        if(DEBUG):
+            print ("DEBUG-INFO:", args)
+
+printer = fprinter()
+
+def check_match(line, filters=[], default=False):
+    matched = None
+    if (len(filters) > 0):
+        for filter in filters:
+            if (filter.startswith('*')):
+                #eg, '*.txt' will report [nothing to repeat] when compile
+                filter = '.' + filter
+            regexp = r'.*(%s)+.*' % filter
+            #m = re.match(regexp, line)
+            p = re.compile(regexp, re.IGNORECASE)
+            m = p.match(line)
+            if (m != None):
+                return m.group(1)
+    else:
+        if (default):
+            matched = line
+        else:
+            matched = None
+        
+    return matched
+
+def get_match(line, filters=[], and_filters=[], exclude_filters=[]):
+    if (check_match(line, exclude_filters, False) != None):
+        return None
+    
+    matched_list = None
+    
+    matched_text = check_match(line, filters, True)
+    if (matched_text != None):
+        matched_list = [matched_text]
+        for filter in and_filters:
+            matched_text = check_match(line, [filter], True)
+            if (matched_text == None):
+                return None
+            else:
+                matched_list.append(matched_text)
+    #printer.debug(matched_list)
+    return matched_list
+
+#callback(line_no, line, matched_list/None, file name/None)
+#grep_result: [[line_no, line, matched_list/None, file name/None], ...]
+def grep(line, filters=[], and_filters=[], exclude_filters=[], context=0, call_back=None, fname=None):
+    global line_no 
+    global grep_result
+    global last_matched_no
+    global history
+    
+    line_no = line_no + 1
+    matched_list = get_match(line, filters, and_filters, exclude_filters)
+    
+    record = [line_no, line, None, fname]
+    
+    if (matched_list != None):
+        record[2] = matched_list
+        pending_list = []
+        
+        if (len(grep_result) > 0):
+            last_record = grep_result[len(grep_result)-1]
+        else:
+            last_record = [-1, None, None]
+        printer.debug("last record", last_record)     
+        for r in history:
+            printer.debug("history: ", r)
+            if (r[0] > last_record[0]):
+                pending_list.append(r)
+        pending_list.append(record)
+            
+        for r in pending_list:    
+            grep_result.append(r)
+            call_back(r)
+        last_matched_no = line_no
+    elif ((last_matched_no > -1) and (line_no - last_matched_no <= context)):
+        grep_result.append(record)
+        call_back(record)
+    
+    history.append(record)
+    
+    return (matched_list != None)
+    
+def gen_final_report(result, save_to=None):
+    global show_line_no
+    if (show_line_no):
+        try:
+            with open(save_to,'w') as file_io:
+                for it in result:
+                    text = "%d: %s" % (it[0], it[1])
+                    file_io.write(text)
+                printer.printf("Filtered result saved to:{0}".format(save_to), printer.TYPE_TITLE)
+        except IOError as e:
+            printer.printf("I/O error({0}): {1}".format(e.errno, e.strerror), printer.TYPE_ERROR)
+            #print ("I/O error({0}): {1}".format(e.errno, e.strerror))
+    else:
+        try:
+            with open(save_to,'w') as file_io:
+                for it in result:
+                    file_io.write(it[1])
+                printer.printf("Filtered result saved to:{0}".format(save_to), printer.TYPE_TITLE)
+        except IOError as e:
+            printer.printf("I/O error({0}): {1}".format(e.errno, e.strerror), printer.TYPE_ERROR)
+            #print ("I/O error({0}): {1}".format(e.errno, e.strerror))
+
+def gen_runtime_report(record):
+    global show_line_no
+    global show_file_name
+    
+    text = ""
+    if (show_file_name):
+        text = "[%s] " % record[3]
+        
+    if (show_line_no):
+        text = "%s%d: %s" % (text, record[0], record[1])
+    else:
+        text = "%s%s" % (text, record[1])
+        
+    printer.printf(text, printer.TYPE_NORMAL, record[2])
+
+ 
+def prepare_save_to(save_to=None, default_prefix=''):
+    result = None
+    if (not save_to == None):
+        save_to = save_to.strip("\r\n")
+        save_to = os.path.abspath(save_to)
+        if (os.path.isdir(save_to)):
+            from datetime import datetime
+            filtered_file_name = "{0}_filtered_{1}.txt".format(default_prefix, datetime.now().strftime("%Y%m%d_%H%M%S"))
+            result = os.path.join(save_to, filtered_file_name)
+        else:
+            result = save_to
+    printer.debug("save to:", result)
+    return result       
+    
+def do_single_file_analyse(fd, filters=[], and_filters=[], exclude_filters=[], break_filters=[], context=0, save_to=None):
+    global line_no 
+    global grep_result
+    global last_matched_no
+    global history
+    
+    line_no = -1
+    last_matched_no = -1
+    grep_result = []
+    history.clear()
+    
+    matched = False   
+    try:
+        while True:
+            line = fd.readline()
+            if (not line):
+                break
+            
+            ret = grep(line, filters, and_filters, exclude_filters, context, gen_runtime_report, get_fd_name(fd)) 
+            if (ret):
+                matched = True
+                if (check_match(line, break_filters, False) != None):
+                    keyinput_wait()
+    except IOError as e: #file not existed etc
+        printer.printf("I/O error({0}): {1}".format(e.errno, e.strerror), printer.TYPE_ERROR)
+    
+    if (not save_to == None):
+        gen_final_report(grep_result, save_to)
+        
+    return matched
+    
+def force_terminate_process():
+    os._exit(1)
+    
+def exception_handler(signum, frame):
+    global app_abort
+    app_abort = True
+    
+    if (os.name == 'nt'): 
+        import ctypes
+        handle = ctypes.windll.kernel32.GetStdHandle(fprinter.STD_OUTPUT_HANDLE)
+        ctypes.windll.kernel32.SetConsoleTextAttribute(handle, fprinter.FOREGROUND_WHITE)
+    
+    try:
+       sys.exit(0)
+    except SystemExit:
+        force_terminate_process()
+    
+def keyinput_workthread():
+    global app_abort
+    
+    while not app_abort:
+        key = msvcrt.getch()
+        if (key == '\x03'):
+            #CTRL + C
+            exception_handler(None, None)
+        else:
+            print(key)
+
+def keyinput_wait():
+    printer.printf("\nHit any key to continue ...")
+    key = msvcrt.getch()
+    if (key == '\x03'):
+        #CTRL + C
+        exception_handler(None, None)
+    else:
+        return key
+    
+         
+def do_analyse(fds, filters=[], and_filters=[], exclude_filters=[], break_filters=[], context=0, save_to=None): 
+    signal.signal(signal.SIGINT, exception_handler)
+    signal.signal(signal.SIGTERM, exception_handler)
+    
+    workthread = Thread(target=keyinput_workthread)
+    workthread.setDaemon(True)
+    workthread.start() 
+    
+    count = len(fds)
+    
+    for fd in fds:
+        matched = do_single_file_analyse(fd, filters, and_filters, exclude_filters, break_filters, context, save_to)
+        if (count > 1):
+            printer.printf("\n**************** " + get_fd_name(fd) + " grab finished ********************\n")
+            if (wait_user_command and matched and (fd != fds[count-1])):
+                keyinput_wait()
+    return 0
+
+def get_fd_name(fd):
+    ret = "unknown"
+    from urllib import addinfourl 
+    if (isinstance(fd, file)):
+        ret = fd.name
+    elif (isinstance(fd, addinfourl)):
+        ret = "HTTP"
+    
+    return ret
+    
+def is_url(url):
+    p = re.compile(
+        r'^(?:http|ftp)s?://' # http:// or https://
+        r'(?:(?:[A-Z0-9](?:[A-Z0-9-]{0,61}[A-Z0-9])?\.)+(?:[A-Z]{2,6}\.?|[A-Z0-9-]{2,}\.?)|' #domain...
+        r'localhost|' #localhost...
+        r'\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})' # ...or ip
+        r'(?::\d+)?' # optional port
+        r'(?:/?|[/?]\S+)$', re.IGNORECASE)
+    m = p.match(url)
+    if (m != None):
+        return True
+    else:
+        return False
+
+def is_name_match(name, filter):
+    if (filter.find('*') > -1):
+        #eg, '*.txt' will report "nothing to repeat" when compile
+        filter = filter.replace('*', '.*') + '.*'
+    p = re.compile(filter+'$', re.IGNORECASE)    
+    m = p.match(name)
+    return (m != None)
+
+    
+# option = id : [maximum paras accepted, at continuous recording ? , values, [keyword0, keyword1, help info]]
+options = {
+             'filters':           [999, False, [],    ['-p', '--pattern', 'filter with given filters']],
+             'exclude_filters':   [999, False, [],    ['-e', '--exclude', 'exclude with given filters']],
+             'and_filters':       [999, False, [],    ['-a', '--and', 'additional filters']],
+             'break_filters':     [999, False, [],    ['-br', '--break', 'break filters, wait user hit key to continue if match']],
+             'show_line_no':      [0,   False, False, ['-n', '--no', 'show line number']],
+             'show_file_name':    [0,   False, False, ['-f', '--fname', 'show file name']],
+             'wait_user_command': [0,   False, False, ['-w', '--wait', 'wait user hit any key to continue']],
+             'context':           [1,   False, [],    ['-c', '--context', 'print number of lines of output context']],
+             'build_error':       [0,   False, False, ['-b', '--build-error', 'filter build errors']],
+             'save_to':           [1,   False, [],    ['-s', '--save-to', 'save filtered result to given file']]
+           } 
+           
+OP_AND_KEYWORDS = ['-a', '--and']
+OP_OR_KEYWORDS = ['-o', '--or']
+
+OP_AND = 1
+OP_OR = 2
+
+CMD_TYPE_ROOT = 'root'
+CMD_TYPE_LIST = 'list'
+CMD_TYPE_BOOLEAN = 'boolean'
+CMD_TYPE_NUMBERIC = 'numberic' 
+CMD_TYPE_STRING = 'string'
+CMD_TYPE_CUSTOM_BOOLEAN = 'custom'
+
+COMMAND_KEY_FILTERS = 'filters'
+COMMAND_KEY_EXCLUDE_FILTERS = 'exclude_filters'
+COMMAND_KEY_BREAK_FILTERS = "break_filters"
+COMMAND_KEY_SHOW_LINE_NO = 'show_line_no'
+COMMAND_KEY_SHOW_FILE_NAME = 'show_file_name'
+COMMAND_KEY_WAIT_USER_COMMAND = 'wait_user_command'
+COMMAND_KEY_CONTEXT = 'context'
+COMMAND_KEY_SAVE_TO = 'save_to'
+COMMAND_KEY_OPERATOR = 'operator'
+
+COMMAND_LIST = {
+                    COMMAND_KEY_FILTERS:             [CMD_TYPE_LIST,     [],      ['-p', '-pattern']   , 'filter with given filters'],
+                    COMMAND_KEY_EXCLUDE_FILTERS:     [CMD_TYPE_LIST,     [],      ['-e', '--exclude']  , 'exclude with given filters'],
+                    COMMAND_KEY_SHOW_LINE_NO:        [CMD_TYPE_BOOLEAN,  False,   ['-n', '--no']       , 'show line number'],
+                    COMMAND_KEY_SHOW_FILE_NAME:      [CMD_TYPE_BOOLEAN,  False,   ['-f', '--fname']    , 'show file name'],
+                    COMMAND_KEY_WAIT_USER_COMMAND:   [CMD_TYPE_BOOLEAN,  False,   ['-w', '--wait']    , 'wait user hit any key to continue'],
+                    COMMAND_KEY_CONTEXT:             [CMD_TYPE_NUMBERIC, 0,       ['-c', '--context']  , 'print number of lines of output context'],
+                    COMMAND_KEY_SAVE_TO:             [CMD_TYPE_STRING,   None,    ['-s', '--save-to']  , 'save filtered result to given file']
+               }
+               
+OP_LIST = {
+              COMMAND_KEY_OPERATOR:[CMD_TYPE_LIST, None, ['-a', '-o', '-and', '-or'], 'logical operator']
+          }
+               
+DEFAULT_COMMAND_KEYWORD = COMMAND_KEY_FILTERS
+    
+def decode_args(args):
+    parameters = {
+                  'fds'            :[],
+                  'filters'        :[],
+                  'and_filters'    :[],
+                  'exclude_filters':[],
+                  'break_filters'  :[],
+                  'context'        :0,
+                  'show_line_no'   :False,
+                  'show_file_name' :False,
+                  'wait_user_command' :False,
+                  'build_error'    :False,
+                  'save_to'        :None
+                 }
+                    
+    # firstly check for pipe, it found then all args consider as filters
+    para_list = []
+    if (not sys.stdin.isatty()):
+        if (os.name == 'posix'):
+            import select
+            #this statement mainly for find & xargs scenario
+            if sys.stdin in select.select([sys.stdin], [], [], 0)[0]:
+                parameters['fds'].append(sys.stdin)
+            else:
+                #eg. find & xargs will trigger here
+                printer.debug("no pipe input")
+        else:
+            #so, here got potential risk: if stdin is empty it will block the main thread while stdin.readlines()
+            #but no select mechanism available for regular file on windows
+            parameters['fds'].append(sys.stdin)
+        
+        if (len(parameters['fds']) > 0):
+            # if read from pipe, all args must be parameters
+            para_list = args
+        #printer.debug("read from pipe: parameters['fds']=", parameters['fds'], "para_list=", para_list)
+    
+    if ((len(para_list) == 0) and (len(args) > 0)):
+        # 2nd check for os.sep which pass by find & xargs
+        for i in range(len(args)):
+            if ((args[i].find(os.sep)) > -1 and (os.path.exists(args[i])) and (not is_url(args[i]))):
+                if ((i > 0) and (args[i-1] == '.')):
+                    #if found os.sep, consider the paras is passed by find&xargs, means maybe pass in '.'
+                    files_begin = i - 1
+                else:
+                    files_begin = i
+                    
+                para_list = args[:files_begin]
+                for file in args[files_begin:]:
+                    if (os.path.isfile(file)):
+                        #skip folder
+                        try:
+                            fd = open(file, 'r')
+                            parameters['fds'].append(fd)                            
+                        except IOError as e: #file not existed etc
+                            printer.printf("I/O error({0}): {1}".format(e.errno, e.strerror), printer.TYPE_ERROR)
+                #printer.debug("read from find: parameters['fds']=", parameters['fds'], "para_list=", para_list)
+                break
+        
+    if ((len(para_list) == 0) and (len(args) > 0)):
+        #3rd check for user input parameters, files always stand at the beginning
+        if (args[0].find('*') > -1):
+            for root, dirs, files in os.walk(os.getcwd()):
+                for name in files:
+                    if (is_name_match(name, args[0])):
+                        try:
+                            fd = open(name, 'r')
+                            parameters['fds'].append(fd)                            
+                        except IOError as e: #file not existed etc
+                            printer.printf("I/O error when open [{0}]:({1}): {2}".format(name, e.errno, e.strerror), printer.TYPE_ERROR) 
+            para_list = args[1:]
+        else:
+            for i in range(len(args)):
+                if (os.path.isfile(args[i])):
+                    #skip folder
+                    try:
+                        fd = open(args[i], 'r')
+                        parameters['fds'].append(fd)                            
+                    except IOError as e: #file not existed etc
+                        printer.printf("I/O error({0}): {1}".format(e.errno, e.strerror), printer.TYPE_ERROR)
+                elif (is_url(args[i])):
+                    import urllib2
+                    try:
+                        #fd = urllib2.urlopen(args[i])
+                        proxy_handler = urllib2.ProxyHandler({})
+                        opener = urllib2.build_opener(proxy_handler)
+                        urllib2.install_opener(opener)  #install public opener with no proxy
+                        req = urllib2.Request(sys.argv[1])
+                        fd = opener.open(req)
+                        parameters['fds'].append(fd)
+                    except urllib2.HTTPError, e:
+                        printer.printf("HTTPError: {0}".format(str(e.code)), printer.TYPE_ERROR)
+                    except urllib2.URLError, e:
+                        printer.printf("URLError: {0}".format(str(e.reason)), printer.TYPE_ERROR)
+                    except httplib.HTTPException, e:
+                        printer.printf("URLError: {0}".format(str(e.reason)), printer.TYPE_ERROR)
+                    except :
+                        printer.printf("open url fail: {0}".format(args[i]), printer.TYPE_ERROR)
+                else:
+                    para_list = args[i:]
+                    break
+        printer.debug("read from user input: parameters['fds']=", parameters['fds'], "para_list=", para_list)
+   
+    if (len(parameters['fds']) > 0):
+        # it make sense only when files is there
+        options_keys = options.keys()
+        orphan_paras = []
+        for para in para_list:
+            handled = False
+            for op in options_keys:
+                #we only match with full match, so -c000 won't match with -c
+                if ((options[op][3][0] == para) or (options[op][3][1] == para)):
+                    #clear all recording flag
+                    for it in options_keys:
+                        options[it][1] = False
+                    if (options[op][0] != 0):
+                        #support continuous recording
+                        options[op][1] = True
+                    else:
+                        #just accept boolean value, save result
+                        options[op][2] = True
+                    handled = True
+                    break
+       
+            if (handled):
+                continue
+                
+            for op in options_keys:
+                if (options[op][1]):
+                    if (len(options[op][2]) < options[op][0]):
+                        options[op][2].append(para)
+                        handled = True
+                    break
+            if (not handled):  
+                orphan_paras.append(para)
+            
+        parameters['filters'] = options['filters'][2]
+        for para in orphan_paras:
+            parameters['filters'].append(para)
+        parameters['and_filters'] = options['and_filters'][2]
+        parameters['exclude_filters'] = options['exclude_filters'][2]
+        parameters['break_filters'] = options['break_filters'][2]
+        parameters['show_line_no'] = options['show_line_no'][2]
+        parameters['show_file_name'] = options['show_file_name'][2]
+        parameters['wait_user_command'] = options['wait_user_command'][2]
+        
+        if (len(options['context']) > 0):
+            try:
+                parameters['context'] = int(options['context'][2][0])
+            except:
+                printer.debug("convert contxt to int fail, ignore")
+        if (len (options['save_to'][2]) > 0):
+            parameters['save_to'] = options['save_to'][2][0]
+        
+        if (options['build_error'][2]):
+            for filter in build_error_filters:
+                parameters['filters'].append(filter)
+     
+    debug_file_info = parameters['fds']
+    if (len (debug_file_info) > 0 and isinstance (debug_file_info[0], list)):
+        debug_file_info = "pipe list"
+    printer.debug("parameters['fds']=" ,debug_file_info,  "parameters['filters']=", parameters['filters'], "parameters['and_filters']=", parameters['and_filters'], " parameters['exclude_filters']=",  parameters['exclude_filters'], "parameters['show_line_no']=", parameters['show_line_no'],
+                    "parameters['context']=", parameters['context'], "options['build_error']", options['build_error'][2], "parameters['save_to']=", parameters['save_to'], "parameters['show_file_name']=", parameters['show_file_name'], "parameters['wait_user_command']=", parameters['wait_user_command'] ,
+                    "parameters['break_filters']=", parameters['break_filters'])                
+    
+    return  parameters          
+    
+def help():
+    h = '''Usage: grab * | file0 file1 ... | url 
+            [-p] filter0 filter1 ... 
+            [-a filters] 
+            [-e filters] 
+            [-br filters]
+            [-c num] 
+            [-s file]
+            [-f] [-b] [-n] [-w]'''
+    opts = options.values()
+    print (h)
+    print ("\nOptions:")
+    for opt in opts:
+        sys.stdout.write('        ')
+        print(opt[3])
+    rel = "\nVersion:" + VERSION + ", written by Andy Tang, last update:" + LAST_UPDATE
+    print(rel)
+    
+def main(args):
+    global show_line_no
+    global show_file_name
+    global wait_user_command
+    global history
+ 
+    if (DEBUG):
+        printer.debug("main(): args=", args)
+        from time import clock
+        start_time = clock()
+    
+    try:
+        parameters = decode_args(args)
+        if (len(parameters['fds']) == 0):
+            help()
+            return 1
+            
+        show_line_no = parameters['show_line_no']
+        show_file_name = parameters['show_file_name']
+        wait_user_command = parameters['wait_user_command']
+        
+        prefix = 'grab'
+        save_to = prepare_save_to(parameters['save_to'], prefix)
+        if (parameters['context'] > 0):
+            history = deque(maxlen=parameters['context'])
+            
+        try:
+            do_analyse(parameters['fds'], parameters['filters'], parameters['and_filters'], parameters['exclude_filters'], parameters['break_filters'], parameters['context'], save_to)
+        finally:
+            for fd in parameters['fds']:
+                fd.close()
+    except KeyboardInterrupt as e0:
+        pass
+    except BaseException as e:
+        print e
+    
+    if (DEBUG):
+        end_time = clock()    
+        printer.debug("Time elapsed:",  end_time - start_time)
+        
+    return 0
+            
+#----------------------------------------------------------------------------
+#----------------------------------------------------------------------------
+if __name__ == '__main__':
+    main(sys.argv[1:])
+#=========================================================================================================================
